@@ -364,12 +364,18 @@ class EncodedSymbol:
         articulation: str = nonote,
         position: str = nonote,
         coordinates: tuple[float, float] | None = None,
+        rhythm_candidates: tuple[tuple[str, float], ...] = (),
     ) -> None:
         self.rhythm = rhythm
         self.pitch = pitch
         self.lift = lift
         self.articulation = articulation
         self.position = position
+        # Alternative duration tokens emitted by the rhythm decoder. The float is
+        # the logit penalty relative to the greedy token (0 is the chosen token).
+        # This metadata is deliberately excluded from equality/string output so
+        # training-token compatibility and existing callers remain unchanged.
+        self.rhythm_candidates = rhythm_candidates
 
         # These coordinates are derived from transformer attention and are inherently imprecise,
         # since the model is optimized for predictive accuracy rather than spatial localization.
@@ -403,6 +409,7 @@ class EncodedSymbol:
         result = copy.copy(self)
         result.rhythm = match[1] + "_" + str(duration) + match[3]
         result._duration = None
+        result.rhythm_candidates = ()
         return result
 
     def change_lift(self, lift: str) -> "EncodedSymbol":
@@ -590,12 +597,16 @@ def _flatten_measures(measures: list[list[list[EncodedSymbol]]]) -> list[list[En
     return [chord for measure in measures for chord in measure]
 
 
-def _get_duration_of_measure(measure: list[list[EncodedSymbol]]) -> Fraction:
+def _get_duration_of_measure(
+    measure: list[list[EncodedSymbol]], position: str | None = None
+) -> Fraction:
     total_duration = Fraction(0)
     for chord in measure:
         duration = Fraction(0)
         for symbol in chord:
-            if symbol.rhythm.startswith(("note", "rest")):
+            if symbol.rhythm.startswith(("note", "rest")) and (
+                position is None or symbol.position == position
+            ):
                 fraction = symbol.get_duration().fraction
                 if fraction > Fraction(0) and (fraction < duration or duration == Fraction(0)):
                     duration = fraction
@@ -603,15 +614,62 @@ def _get_duration_of_measure(measure: list[list[EncodedSymbol]]) -> Fraction:
     return total_duration
 
 
-def _get_typical_duration_of_measures(measures: list[list[list[EncodedSymbol]]]) -> Fraction:
-    durations = [_get_duration_of_measure(m) for m in measures]
+def _get_typical_duration_of_measures(
+    measures: list[list[list[EncodedSymbol]]], position: str | None = None
+) -> Fraction:
+    durations = [
+        duration
+        for measure in measures
+        if (duration := _get_duration_of_measure(measure, position)) > 0
+    ]
     if len(durations) == 0:
         return Fraction(0)
     return sorted(durations)[len(durations) // 2]
 
 
-def _remove_tuplets(measure: list[list[EncodedSymbol]]) -> list[list[EncodedSymbol]]:
-    return [[symbol.remove_tuplet() for symbol in chord] for chord in measure]
+def _remove_tuplets(
+    measure: list[list[EncodedSymbol]], position: str | None = None
+) -> list[list[EncodedSymbol]]:
+    return [
+        [
+            symbol.remove_tuplet() if position is None or symbol.position == position else symbol
+            for symbol in chord
+        ]
+        for chord in measure
+    ]
+
+
+def _remove_one_exact_tuplet_boundary(
+    measure: list[list[EncodedSymbol]], position: str, target: Fraction
+) -> list[list[EncodedSymbol]] | None:
+    """Detach one uniquely evidenced boundary note from a mixed tuplet run."""
+    tuplet_chords = [
+        index
+        for index, chord in enumerate(measure)
+        if any(
+            symbol.position == position
+            and symbol.rhythm.startswith(("note_", "rest_"))
+            and symbol.is_tuplet()
+            for symbol in chord
+        )
+    ]
+    boundary_indices: set[int] = set()
+    for index in tuplet_chords:
+        if index - 1 not in tuplet_chords or index + 1 not in tuplet_chords:
+            boundary_indices.add(index)
+
+    exact_candidates = []
+    for candidate_index in boundary_indices:
+        candidate = [list(chord) for chord in measure]
+        candidate[candidate_index] = [
+            symbol.remove_tuplet() if symbol.position == position else symbol
+            for symbol in candidate[candidate_index]
+        ]
+        if _get_duration_of_measure(candidate, position) == target:
+            exact_candidates.append(candidate)
+    if len(exact_candidates) == 1:
+        return exact_candidates[0]
+    return None
 
 
 def _fix_over_eager_tuplets(chords: list[list[EncodedSymbol]]) -> list[list[EncodedSymbol]]:
@@ -620,14 +678,38 @@ def _fix_over_eager_tuplets(chords: list[list[EncodedSymbol]]) -> list[list[Enco
     based on the length of a measurement.
     """
     measures = _group_into_measures(chords)
-    mean = _get_typical_duration_of_measures(measures)
+    positions = sorted(
+        {
+            symbol.position
+            for measure in measures
+            for chord in measure
+            for symbol in chord
+            if symbol.position in {"upper", "lower"}
+            and symbol.rhythm.startswith(("note_", "rest_"))
+        }
+    )
     result = []
     for i, measure in enumerate(measures):
-        if _get_duration_of_measure(measure) < mean:
-            eprint("Removing tuplets from measure #", i + 1)
-            result.append(_remove_tuplets(measure))
-        else:
-            result.append(measure)
+        corrected = measure
+        for position in positions:
+            typical = _get_typical_duration_of_measures(measures, position)
+            current_duration = _get_duration_of_measure(corrected, position)
+            boundary_fix = _remove_one_exact_tuplet_boundary(corrected, position, typical)
+            if current_duration < typical and boundary_fix is not None:
+                eprint("Detached one tuplet boundary in measure #", i + 1, position)
+                corrected = boundary_fix
+                continue
+            without_tuplets = _remove_tuplets(corrected, position)
+            expanded_duration = _get_duration_of_measure(without_tuplets, position)
+            if (
+                typical > 0
+                and current_duration > 0
+                and current_duration < typical
+                and abs(expanded_duration - typical) < abs(current_duration - typical)
+            ):
+                eprint("Removing tuplets from measure #", i + 1, position)
+                corrected = without_tuplets
+        result.append(corrected)
     return _flatten_measures(result)
 
 

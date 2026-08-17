@@ -7,19 +7,41 @@ from time import perf_counter
 import cv2
 import numpy as np
 
-from homr.onnxruntime_utils import create_inference_session, preload_cuda_dlls
+from homr.onnxruntime_utils import (
+    create_inference_session,
+    preload_cuda_dlls,
+    uses_fp16_models,
+)
 from homr.segmentation.config import (
+    find_coreml_segnet_path,
     segmentation_version,
     segnet_path_onnx,
     segnet_path_onnx_fp16,
 )
+from homr.segmentation.coreml_segnet import NativeCoreMLSegnet
 from homr.simple_logging import eprint
 from homr.type_definitions import NDArray
+
+_LAST_SEGNET_BACKEND = "not-run"
 
 
 class Segnet:
     def __init__(self, use_gpu_inference: bool) -> None:
-        if use_gpu_inference:
+        self.native_coreml: NativeCoreMLSegnet | None = None
+        coreml_path = find_coreml_segnet_path()
+        native_coreml_enabled = os.environ.get("HOMR_NATIVE_COREML", "1") != "0"
+        if use_gpu_inference and native_coreml_enabled and coreml_path is not None:
+            try:
+                self.native_coreml = NativeCoreMLSegnet(coreml_path)
+                self.fp16 = False
+                self.use_gpu = False
+                self.backend = "native-coreml-cpu-and-neural-engine"
+                eprint(f"Segnet: native Core ML model enabled: {coreml_path}")
+                return
+            except Exception as exc:
+                eprint(f"Segnet: native Core ML load failed, falling back to ONNX Runtime: {exc}")
+
+        if uses_fp16_models(use_gpu_inference):
             preload_cuda_dlls()
             self.model, self.use_gpu = create_inference_session(
                 segnet_path_onnx_fp16,
@@ -30,10 +52,12 @@ class Segnet:
         else:
             self.model, self.use_gpu = create_inference_session(
                 segnet_path_onnx,
-                use_gpu_inference=False,
+                use_gpu_inference=use_gpu_inference,
                 component_name="Segnet",
             )
             self.fp16 = False
+
+        self.backend = self.model.get_providers()[0]
 
         self.io_binding = self.model.io_binding()
         self.device_id = 0
@@ -42,6 +66,9 @@ class Segnet:
         self.output_name = self.model.get_outputs()[0].name
 
     def run(self, input_data: NDArray) -> NDArray:
+        if self.native_coreml is not None:
+            return self.native_coreml.run(input_data)
+
         if self.fp16:
             self.io_binding.bind_cpu_input("input", input_data.astype(np.float16))
         else:
@@ -147,6 +174,8 @@ def inference(
         step_size = win_size // 2
 
     model = Segnet(use_gpu_inference)
+    global _LAST_SEGNET_BACKEND  # noqa: PLW0603
+    _LAST_SEGNET_BACKEND = model.backend
 
     image_org = cv2.cvtColor(image_org, cv2.COLOR_GRAY2BGR)
     image = np.transpose(image_org, (2, 0, 1)).astype(np.float32)
@@ -188,6 +217,10 @@ def inference(
     symbols = (merged == 5).astype(np.uint8)
 
     return staff, symbols, stems_rests, notehead, clefs_keys
+
+
+def get_last_segnet_backend() -> str:
+    return _LAST_SEGNET_BACKEND
 
 
 def extract(

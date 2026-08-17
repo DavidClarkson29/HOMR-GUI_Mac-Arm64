@@ -104,7 +104,8 @@ ignore = [
     "PLR0912",  # the parsing & conversion logic tends to create large functions, if someone has an idea then open a PR please!
     "PLR0915",  # the parsing & conversion logic tends to create large functions, if someone has an idea then open a PR please!
     "C901",  # the parsing & conversion logic tends to create large functions , if someone has an idea then open a PR please!
-    "PLR2004"  # 
+    "PLR2004", # Magic values are used extensively in the existing image pipeline
+    "PLR0917", # Functions in the inference pipeline deliberately group runtime parameters
 ]
 
 [tool.ruff.lint.flake8-tidy-imports]

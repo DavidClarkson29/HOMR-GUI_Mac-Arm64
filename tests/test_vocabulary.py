@@ -3,6 +3,7 @@ from fractions import Fraction
 
 from homr.transformer.vocabulary import (
     EncodedSymbol,
+    _fix_over_eager_tuplets,
     kern_to_symbol_duration,
     remove_duplicated_symbols,
 )
@@ -171,6 +172,68 @@ barline . . . ."""
         ]
 
         self.assertEqual(token_lines_to_str(result), token_lines_to_str(expected))
+
+    def test_tuplet_cleanup_is_decided_independently_per_staff(self) -> None:
+        def symbol(rhythm: str, position: str) -> EncodedSymbol:
+            return EncodedSymbol(rhythm, "C4", "_", "_", position)
+
+        full_bar = [
+            [symbol("note_1", "upper"), symbol("note_1", "lower")],
+            [EncodedSymbol("barline")],
+        ]
+        mixed_bar = []
+        for index in range(7):
+            chord = []
+            if index < 3:
+                chord.append(symbol("note_12", "upper"))
+            elif index < 6:
+                chord.append(symbol("note_4", "upper"))
+            if index < 6:
+                chord.append(symbol("note_12", "lower"))
+            else:
+                chord.append(symbol("note_4", "lower"))
+            mixed_bar.append(chord)
+        mixed_bar.append([EncodedSymbol("barline")])
+
+        corrected = _fix_over_eager_tuplets(full_bar + mixed_bar + full_bar)
+        upper_tuplets = [
+            item.rhythm
+            for chord in corrected
+            for item in chord
+            if item.position == "upper" and item.is_tuplet()
+        ]
+        lower_tuplets = [
+            item.rhythm
+            for chord in corrected
+            for item in chord
+            if item.position == "lower" and item.is_tuplet()
+        ]
+
+        self.assertEqual(upper_tuplets, ["note_12"] * 3)
+        self.assertEqual(lower_tuplets, [])
+
+    def test_mixed_tuplet_run_detaches_unique_boundary_note(self) -> None:
+        def symbol(rhythm: str) -> EncodedSymbol:
+            return EncodedSymbol(rhythm, "C4", "_", "_", "upper")
+
+        full_bar = [[symbol("note_1")], [EncodedSymbol("barline")]]
+        mixed_bar = [
+            [symbol("note_2")],
+            [symbol("note_4")],
+            [symbol("note_12")],
+            [symbol("note_24")],
+            [symbol("note_24")],
+            [symbol("note_24")],
+            [EncodedSymbol("barline")],
+        ]
+
+        corrected = _fix_over_eager_tuplets(full_bar + mixed_bar + full_bar)
+        rhythms = [item.rhythm for chord in corrected for item in chord if item.position == "upper"]
+
+        self.assertEqual(
+            rhythms,
+            ["note_1", "note_2", "note_4", "note_8", "note_24", "note_24", "note_24", "note_1"],
+        )
 
     def test_only_keep_lower_staff_if_there_is_a_clef(self) -> None:
         tokens = [

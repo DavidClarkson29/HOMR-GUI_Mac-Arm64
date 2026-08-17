@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 
 from homr.bounding_boxes import RotatedBoundingBox
-from homr.model import MultiStaff, Staff, StaffPoint
+from homr.model import BarLine, MultiStaff, Staff, StaffPoint
 
 
 def make_staff(number: int) -> Staff:
@@ -18,6 +18,15 @@ def make_connection(number: int) -> RotatedBoundingBox:
 
 
 class TestModel(unittest.TestCase):
+
+    def test_barline_keeps_accumulated_coordinate_transforms(self) -> None:
+        box = RotatedBoundingBox(((10.0, 20.0), (4.0, 40.0), 0.0), np.empty((0, 0)))
+        barline = BarLine(box)
+
+        first = barline.transform_coordinates(lambda point: (point[0] * 2, point[1] * 2))
+        second = first.transform_coordinates(lambda point: (point[0] + 5, point[1] + 5))
+
+        self.assertEqual(second.center, (25.0, 45.0))
 
     def test_multi_staff_merge(self) -> None:
         staff1 = MultiStaff(
@@ -39,6 +48,25 @@ class TestModel(unittest.TestCase):
             result2.connections,
             [staff2.connections[0], staff2.connections[1], staff1.connections[0]],
         )
+
+    def test_staff_merge_keeps_the_complete_width_of_both_hands(self) -> None:
+        upper = Staff(
+            [
+                StaffPoint(0, [0, 10, 20, 30, 40], 0),
+                StaffPoint(300, [0, 10, 20, 30, 40], 0),
+            ]
+        )
+        lower = Staff(
+            [
+                StaffPoint(0, [100, 110, 120, 130, 140], 0),
+                StaffPoint(900, [100, 110, 120, 130, 140], 0),
+            ]
+        )
+
+        merged = upper.merge(lower)
+
+        self.assertEqual((merged.min_x, merged.max_x), (0, 900))
+        self.assertEqual(len(merged.grid[-1].y), 10)
 
     def test_create_grandstaffs_even(self) -> None:
         staffs = [make_staff(i) for i in range(4)]

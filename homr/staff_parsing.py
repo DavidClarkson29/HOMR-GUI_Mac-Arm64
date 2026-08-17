@@ -4,9 +4,11 @@ import cv2
 import numpy as np
 
 from homr import constants
+from homr.barline_recovery import recover_missing_barlines
 from homr.debug import Debug
 from homr.image_utils import crop_image_and_return_new_top
-from homr.model import MultiStaff, Staff
+from homr.model import BarLine, MultiStaff, Staff
+from homr.rhythm_correction import correct_rhythm_consistency
 from homr.simple_logging import eprint
 from homr.staff_dewarping import StaffDewarping, dewarp_staff_image
 from homr.staff_parsing_tromr import parse_staff_tromr
@@ -26,7 +28,7 @@ def _have_all_the_same_number_of_staffs(staffs: list[MultiStaff]) -> bool:
 def _is_close_to_image_top_or_bottom(staff: MultiStaff, image: NDArray) -> bool:
     tolerance = 50.0
     closest_distance_to_top_or_bottom: list[float] = [
-        min(s.min_x, image.shape[0] - s.max_x) for s in staff.staffs
+        min(s.min_y, image.shape[0] - s.max_y) for s in staff.staffs
     ]
     return min(closest_distance_to_top_or_bottom) < tolerance
 
@@ -38,13 +40,18 @@ def _ensure_same_number_of_staffs(staffs: list[MultiStaff], image: NDArray) -> l
         if _is_close_to_image_top_or_bottom(
             staffs[0], image
         ) and _have_all_the_same_number_of_staffs(staffs[1:]):
-            eprint("Removing first system from all voices, as it has a different number of staffs")
-            return staffs[1:]
+            eprint(
+                "Keeping first system despite a different number of staffs; "
+                "falling back to independent staff parsing"
+            )
         if _is_close_to_image_top_or_bottom(
             staffs[-1], image
         ) and _have_all_the_same_number_of_staffs(staffs[:-1]):
-            eprint("Removing last system from all voices, as it has a different number of staffs")
-            return staffs[:-1]
+            eprint(
+                "Keeping last system despite a different number of staffs; "
+                "falling back to independent staff parsing"
+            )
+    eprint("Detected mixed staff counts; preserving and parsing every staff independently")
     result: list[MultiStaff] = []
     for staff in staffs:
         result.extend(staff.break_apart())
@@ -182,9 +189,9 @@ def prepare_staff_image(
 
     staff_image = remove_black_contours_at_edges_of_image(staff_image, staff.average_unit_size)
     staff_image = center_image_on_canvas(staff_image, image_dimensions)
+    transformed_staff = _dewarp_staff(staff, dewarp, top_left, scaling_factor)
     debug.write_image_with_fixed_suffix(f"_staff-{index}_input.jpg", staff_image)
     if debug.debug:
-        transformed_staff = _dewarp_staff(staff, dewarp, top_left, scaling_factor)
         transformed_staff_image = staff_image.copy()
         for symbol in transformed_staff.symbols:
             center = symbol.center
@@ -201,7 +208,7 @@ def prepare_staff_image(
         debug.write_image_with_fixed_suffix(
             f"_staff-{index}_debug_annotated.jpg", transformed_staff_image
         )
-    return staff_image, staff
+    return staff_image, transformed_staff
 
 
 def _dewarp_staff(
@@ -232,6 +239,17 @@ def parse_staff_image(
     )
     eprint("Running TrOmr inference on staff image", index)
     result = parse_staff_tromr(staff_image=staff_image, staff=transformed_staff, config=config)
+    result = recover_missing_barlines(
+        result,
+        [
+            float(symbol.center[0])
+            for symbol in transformed_staff.symbols
+            if isinstance(symbol, BarLine)
+            and symbol.box.size[1] <= transformed_staff.average_unit_size * 5.5
+        ],
+        transformed_staff.average_unit_size,
+        require_staff_pair=transformed_staff.is_grandstaff,
+    )
     if debug.debug:
         result_image = staff_image.copy()
         for i, symbol in enumerate(result):
@@ -267,6 +285,14 @@ def parse_staffs(
     # For simplicity we call every staff in a multi staff a voice,
     # even if it's part of a grand staff.
     number_of_voices = _get_number_of_voices(staffs)
+    if all(staff.is_grandstaff for system in staffs for staff in system.staffs):
+        eprint(
+            "Detected",
+            number_of_voices,
+            "piano instrument(s) with",
+            number_of_voices * 2,
+            "staves/tracks",
+        )
     i = 0
     voices = []
     regions = StaffRegions(staffs)
@@ -287,5 +313,6 @@ def parse_staffs(
             result_for_voice.extend(result_staff)
             i += 1
 
-        voices.append(remove_duplicated_symbols(result_for_voice))
+        cleaned_voice = remove_duplicated_symbols(result_for_voice)
+        voices.append(correct_rhythm_consistency(cleaned_voice))
     return voices

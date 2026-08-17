@@ -32,8 +32,9 @@ from homr.noise_filtering import filter_predictions
 from homr.note_detection import add_notes_to_staffs, combine_noteheads_with_stems
 from homr.onnxruntime_utils import (
     configure_onnxruntime_logging,
-    is_cuda_available,
+    is_acceleration_available,
     log_onnxruntime_status,
+    uses_fp16_models,
 )
 from homr.resize import resize_image
 from homr.segmentation.config import segnet_path_onnx, segnet_path_onnx_fp16
@@ -308,7 +309,7 @@ def get_all_image_files_in_folder(folder: str) -> list[str]:
 
 def download_weights(use_gpu_inference: bool) -> None:
     base_url = "https://github.com/liebharc/homr/releases/download/onnx_checkpoints/"
-    if use_gpu_inference:
+    if uses_fp16_models(use_gpu_inference):
         models = [
             segnet_path_onnx_fp16,
             default_config.filepaths.encoder_path_fp16,
@@ -392,7 +393,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    has_gpu_support = is_cuda_available()
+    has_gpu_support = is_acceleration_available()
 
     use_gpu_inference = (
         args.gpu == GpuSupport.AUTO and has_gpu_support

@@ -2,14 +2,17 @@
 
 import re
 import unittest
+from fractions import Fraction
 from typing import Any
 
 import musicxml.xmlelement.xmlelement as mxl
+from music21 import converter
 
 from homr.music_xml_generator import (
     SymbolChord,
     XmlGeneratorArguments,
     generate_xml,
+    infer_shared_time_signature_nominator,
     rebalance_measure_voices,
 )
 from homr.transformer.vocabulary import EncodedSymbol
@@ -18,12 +21,179 @@ from training.transformer.training_vocabulary import (
 )
 
 
+def _note_token(rhythm: str, position: str, midi: int) -> EncodedSymbol:
+    octave = midi // 12 - 1
+    names = ("C", "C", "D", "D", "E", "F", "F", "G", "G", "A", "A", "B")
+    lifts = ("_", "#", "_", "#", "_", "_", "#", "_", "#", "_", "#", "_")
+    pitch_class = midi % 12
+    return EncodedSymbol(
+        rhythm,
+        pitch=f"{names[pitch_class]}{octave}",
+        lift=lifts[pitch_class],
+        articulation="_",
+        position=position,
+    )
+
+
 class TestMusicXmlGenerator(unittest.TestCase):
     """
     MusicXML testing is mostly covered by training/validate_music_xml_conversion.py
     This script requires that the data sets are downloaded and converted and uses
     the data sets to check that back and forth conversion works.
     """
+
+    def test_single_piano_keeps_its_existing_meter_inference_path(self) -> None:
+        tokens = read_token_lines(
+            [
+                "note_4 C4 _ _ upper",
+                "note_4 D4 _ _ upper",
+                "note_4 E4 _ _ upper",
+                "barline . . . .",
+            ]
+        )
+
+        self.assertIsNone(infer_shared_time_signature_nominator([tokens], [True]))
+
+    def test_two_pianos_share_meter_without_merging_their_parts(self) -> None:
+        piano_with_whole_rests = read_token_lines(
+            [
+                "note_4 C4 _ _ upper",
+                "note_4 D4 _ _ upper",
+                "note_4 E4 _ _ upper",
+                "rest_1 _ _ _ lower",
+                "barline . . . .",
+                "note_4 C4 _ _ upper",
+                "note_4 D4 _ _ upper",
+                "note_4 E4 _ _ upper",
+                "rest_1 _ _ _ lower",
+                "barline . . . .",
+            ]
+        )
+        piano_with_pitched_bass = read_token_lines(
+            [
+                "note_4 G4 _ _ upper&note_4 C3 _ _ lower",
+                "note_4 A4 _ _ upper&note_4 D3 _ _ lower",
+                "note_4 B4 _ _ upper&note_4 E3 _ _ lower",
+                "barline . . . .",
+            ]
+        )
+
+        shared = infer_shared_time_signature_nominator(
+            [piano_with_whole_rests, piano_with_pitched_bass], [True, True]
+        )
+        xml = generate_xml(
+            XmlGeneratorArguments(),
+            [piano_with_whole_rests, piano_with_pitched_bass],
+            "",
+        )
+
+        self.assertEqual(Fraction(3, 4), shared)
+        self.assertEqual(2, len(xml.get_children_of_type(mxl.XMLPart)))
+        xml_text = self._xml_to_str(xml)
+        self.assertEqual(2, xml_text.count("XMLBeats(value: 3)"))
+
+    def test_single_piano_infers_repeated_five_quarter_meter_globally(self) -> None:
+        five_quarter_piano = read_token_lines(
+            [
+                "note_4 C4 _ _ upper",
+                "note_4 D4 _ _ upper",
+                "note_4 E4 _ _ upper",
+                "note_4 F4 _ _ upper",
+                "note_4 G4 _ _ upper",
+                "barline . . . .",
+                "note_4 G4 _ _ upper",
+                "note_4 F4 _ _ upper",
+                "note_4 E4 _ _ upper",
+                "note_4 D4 _ _ upper",
+                "note_4 C4 _ _ upper",
+                "barline . . . .",
+            ]
+        )
+
+        shared = infer_shared_time_signature_nominator([five_quarter_piano], [True])
+        xml = generate_xml(XmlGeneratorArguments(), [five_quarter_piano], "")
+
+        self.assertEqual(Fraction(5, 4), shared)
+        xml_text = self._xml_to_str(xml)
+        self.assertIn("XMLBeats(value: 5)", xml_text)
+        self.assertIn("XMLBeatType(value: 4)", xml_text)
+
+    def test_global_meter_consensus_rejects_ambiguous_page(self) -> None:
+        ambiguous = read_token_lines(
+            [
+                "note_4 C4 _ _ upper",
+                "note_4 D4 _ _ upper",
+                "note_4 E4 _ _ upper",
+                "barline . . . .",
+                "note_4 C4 _ _ upper",
+                "note_4 D4 _ _ upper",
+                "note_4 E4 _ _ upper",
+                "note_4 F4 _ _ upper",
+                "barline . . . .",
+            ]
+        )
+
+        self.assertIsNone(infer_shared_time_signature_nominator([ambiguous], [True]))
+
+    def test_unmarked_triplet_staff_does_not_contaminate_shared_meter(self) -> None:
+        symbols: list[EncodedSymbol] = []
+        for _ in range(3):
+            for index in range(12):
+                symbols.append(_note_token("note_8", "upper", 60 + index))
+            for index in range(4):
+                symbols.append(_note_token("note_4", "lower", 48 + index))
+            symbols.append(EncodedSymbol("barline"))
+
+        shared = infer_shared_time_signature_nominator([symbols], [True])
+        xml = generate_xml(XmlGeneratorArguments(), [symbols], "")
+        score = converter.parseData(xml.to_string(), format="musicxml")
+
+        self.assertEqual(Fraction(1), shared)
+        self.assertEqual(score.parts[0].measure(1).timeSignature.ratioString, "4/4")
+
+    def test_genuine_six_four_agreement_is_preserved(self) -> None:
+        symbols: list[EncodedSymbol] = []
+        for _ in range(2):
+            for index in range(6):
+                symbols.append(_note_token("note_4", "upper", 60 + index))
+                symbols.append(EncodedSymbol("chord"))
+                symbols.append(_note_token("note_4", "lower", 48 + index))
+            symbols.append(EncodedSymbol("barline"))
+
+        shared = infer_shared_time_signature_nominator([symbols], [True])
+
+        self.assertEqual(Fraction(3, 2), shared)
+
+    def test_double_tremolo_notes_share_the_notated_total_duration(self) -> None:
+        tokens = [
+            EncodedSymbol("note_1", "C3", "_", "tremolo", "lower"),
+            EncodedSymbol("note_1", "C4", "_", "_", "lower"),
+            EncodedSymbol("barline"),
+        ]
+
+        xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
+        score = converter.parseData(xml.to_string(), format="musicxml")
+        measure = score.parts[0].measure(1)
+        xml_text = xml.to_string()
+
+        self.assertEqual(measure.timeSignature.ratioString, "4/4")
+        self.assertEqual(measure.duration.quarterLength, 4)
+        self.assertEqual([event.duration.quarterLength for event in measure.notes], [2, 2])
+        self.assertEqual(xml_text.count("<actual-notes>2</actual-notes>"), 2)
+        self.assertIn('<tremolo type="start">3</tremolo>', xml_text)
+        self.assertIn('<tremolo type="stop">3</tremolo>', xml_text)
+
+    def test_isolated_single_note_tremolo_keeps_its_full_duration(self) -> None:
+        tokens = [
+            EncodedSymbol("note_1", "C4", "_", "tremolo", "upper"),
+            EncodedSymbol("barline"),
+        ]
+
+        xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
+        score = converter.parseData(xml.to_string(), format="musicxml")
+
+        self.assertEqual(score.parts[0].measure(1).duration.quarterLength, 4)
+        self.assertIn('<tremolo type="single">3</tremolo>', xml.to_string())
 
     def test_chord_with_different_duratons(self) -> None:
         tabi_measure_18_upper = """clef_G2 . . . upper
@@ -130,6 +300,12 @@ XMLDuration(value: 4),
 XMLVoice(value: 2),
 XMLStaff(value: 1),
 XMLNotations()]),
+XMLBackup([XMLDuration(value: 2)]),
+XMLNote([XMLPitch([XMLStep(value: E)]),
+XMLDuration(value: 2),
+XMLVoice(value: 1),
+XMLStaff(value: 1),
+XMLNotations()]),
 XMLBackup([XMLDuration(value: 4)]),
 XMLNote([XMLPitch([XMLStep(value: G)]),
 XMLDuration(value: 1),
@@ -141,18 +317,38 @@ XMLDuration(value: 1),
 XMLVoice(value: 5),
 XMLStaff(value: 2),
 XMLNotations()]),
-XMLNote([XMLPitch([XMLStep(value: E)]),
-XMLDuration(value: 2),
-XMLVoice(value: 1),
-XMLStaff(value: 1),
-XMLNotations()]),
-XMLBackup([XMLDuration(value: 2)]),
 XMLNote([XMLPitch([XMLStep(value: C)]),
 XMLDuration(value: 2),
 XMLVoice(value: 5),
 XMLStaff(value: 2),
 XMLNotations()])])])])"""
         self.assertEqual(self._norm_expected(expected), actual)
+
+    def test_grand_staff_timelines_do_not_require_cross_staff_chord_tokens(self) -> None:
+        grandstaff = """clef_G2 _ _ _ upper&clef_F4 _ _ _ lower
+note_4 C5 _ _ upper
+note_4 C3 _ _ lower
+note_4 D5 _ _ upper
+note_4 D3 _ _ lower
+note_4 E5 _ _ upper
+note_4 E3 _ _ lower
+note_4 F5 _ _ upper
+note_4 F3 _ _ lower
+barline . . . ."""
+        tokens = read_token_lines(grandstaff.splitlines())
+
+        xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
+        score = converter.parseData(xml.to_string(), format="musicxml")
+        upper_measure = score.parts[0].measure(1)
+        lower_measure = score.parts[1].measure(1)
+
+        self.assertEqual(upper_measure.timeSignature.ratioString, "4/4")
+        self.assertEqual(upper_measure.duration.quarterLength, 4)
+        self.assertEqual(lower_measure.duration.quarterLength, 4)
+        upper = list(upper_measure.recurse().notes)
+        lower = list(lower_measure.recurse().notes)
+        self.assertEqual([note.offset for note in upper], [0, 1, 2, 3])
+        self.assertEqual([note.offset for note in lower], [0, 1, 2, 3])
 
     def test_strip_articulations(self) -> None:
         chord = SymbolChord(

@@ -2,30 +2,32 @@ import json
 import os
 from typing import Any
 
+from homr.app_paths import model_dir
 from homr.transformer.vocabulary import Vocabulary
 
-workspace = os.path.join(os.path.dirname(__file__))
+workspace = os.path.dirname(__file__)
 root_dir = os.getcwd()
 
 
 class FilePaths:
     def __init__(self) -> None:
         model_name = "pytorch_model_331-e10346542968cc71fbcce0c0696f3ac963f11ae1"
+        inference_models = str(model_dir())
         self.encoder_path = os.path.join(
-            workspace,
+            inference_models,
             f"encoder_{model_name}.onnx",
         )  # noqa: E501
         self.decoder_path = os.path.join(
-            workspace,
+            inference_models,
             f"decoder_{model_name}.onnx",
         )  # noqa: E501
 
         self.encoder_path_fp16 = os.path.join(
-            workspace,
+            inference_models,
             f"encoder_{model_name}_fp16.onnx",
         )  # noqa: E501
         self.decoder_path_fp16 = os.path.join(
-            workspace,
+            inference_models,
             f"decoder_{model_name}_fp16.onnx",
         )  # noqa: E501
 
