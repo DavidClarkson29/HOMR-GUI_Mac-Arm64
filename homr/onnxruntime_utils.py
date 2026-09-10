@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import onnxruntime as ort
 
+from homr.app_paths import cache_dir
 from homr.simple_logging import eprint
 
 CUDA_EP = "CUDAExecutionProvider"
+COREML_EP = "CoreMLExecutionProvider"
 CPU_EP = "CPUExecutionProvider"
 
 ProviderSpec = str | tuple[str, dict[str, Any]]
@@ -41,6 +44,37 @@ def is_cuda_available() -> bool:
     return ort.get_device() == "GPU" and CUDA_EP in get_available_providers()
 
 
+def is_coreml_available() -> bool:
+    return COREML_EP in get_available_providers()
+
+
+def is_acceleration_available() -> bool:
+    return is_cuda_available() or is_coreml_available()
+
+
+def uses_fp16_models(use_accelerated_inference: bool) -> bool:
+    """Only CUDA uses the repository's dedicated FP16 model exports.
+
+    CoreML starts with the FP32 exports so backend comparisons do not also
+    change model precision. CoreML may still optimize supported operations
+    internally while unsupported operations safely fall back to CPU.
+    """
+    return use_accelerated_inference and is_cuda_available()
+
+
+def should_accelerate_transformer(use_accelerated_inference: bool) -> bool:
+    """Use CUDA for transformers; keep CoreML experimental.
+
+    The current encoder export is substantially slower through CoreML and
+    falls back to CoreML's CPU compute device. Segmentation still benefits
+    from CoreML, so macOS uses a hybrid CoreML-segmentation/CPU-transformer
+    pipeline unless explicitly opted into transformer experiments.
+    """
+    if not use_accelerated_inference:
+        return False
+    return is_cuda_available() or os.environ.get("HOMR_COREML_TRANSFORMER") == "1"
+
+
 def configure_onnxruntime_logging(enable_debug: bool = False) -> None:
     ort.set_default_logger_severity(2 if enable_debug else 3)
 
@@ -67,6 +101,22 @@ def execution_providers(
         if cuda_options is not None:
             cuda_provider = (CUDA_EP, {"device_id": device_id, **cuda_options})
         return [cuda_provider, CPU_EP]
+    if use_gpu_inference and is_coreml_available():
+        coreml_cache = cache_dir() / "coreml"
+        coreml_cache.mkdir(parents=True, exist_ok=True)
+        coreml_options = {
+            # HOMR exports use dynamic batch/sequence dimensions. The CoreML
+            # NeuralNetwork format supports those inputs, while MLProgram
+            # rejects unbounded dimensions during model compilation.
+            "ModelFormat": os.environ.get("HOMR_COREML_MODEL_FORMAT", "NeuralNetwork"),
+            "MLComputeUnits": os.environ.get("HOMR_COREML_COMPUTE_UNITS", "ALL"),
+            "RequireStaticInputShapes": "0",
+            "EnableOnSubgraphs": "0",
+            "ModelCacheDirectory": str(coreml_cache),
+        }
+        if os.environ.get("HOMR_COREML_PROFILE") == "1":
+            coreml_options["ProfileComputePlan"] = "1"
+        return [(COREML_EP, coreml_options), CPU_EP]
     return [CPU_EP]
 
 
@@ -99,7 +149,7 @@ def create_inference_session(
         if not use_gpu_inference:
             raise
 
-        eprint(f"{component_name}: CUDA session failed, retrying with CPUExecutionProvider")
+        eprint(f"{component_name}: accelerated session failed, retrying with CPUExecutionProvider")
         eprint(exc)
         session = ort.InferenceSession(
             model_path,
@@ -109,13 +159,16 @@ def create_inference_session(
         return session, False
 
     session_providers = session.get_providers()
-    uses_cuda = bool(session_providers and session_providers[0] == CUDA_EP)
-    if use_gpu_inference and not uses_cuda:
+    uses_cuda_device_io = bool(session_providers and session_providers[0] == CUDA_EP)
+    uses_acceleration = bool(
+        session_providers and session_providers[0] in (CUDA_EP, COREML_EP)
+    )
+    if use_gpu_inference and not uses_acceleration:
         eprint(
-            f"{component_name}: CUDAExecutionProvider was requested but session providers are "
+            f"{component_name}: acceleration was requested but session providers are "
             f"{session_providers}; running this model on CPU."
         )
-    return session, uses_cuda
+    return session, uses_cuda_device_io
 
 
 def log_onnxruntime_status(use_gpu_inference: bool, once: bool = True) -> None:
@@ -126,13 +179,16 @@ def log_onnxruntime_status(use_gpu_inference: bool, once: bool = True) -> None:
     _RUNTIME_STATUS_LOGGED = True
     providers = get_available_providers()
     cuda_available = is_cuda_available()
+    coreml_available = is_coreml_available()
     eprint(
         f"ONNX Runtime {ort.__version__}; device={ort.get_device()}; "
         f"available providers={providers}"
     )
     if use_gpu_inference and cuda_available:
         eprint("CUDA acceleration enabled via CUDAExecutionProvider.")
+    elif use_gpu_inference and coreml_available:
+        eprint("Apple acceleration enabled via CoreMLExecutionProvider with CPU fallback.")
     elif use_gpu_inference:
-        eprint("CUDA was requested, but CUDAExecutionProvider is unavailable; using CPU fallback.")
+        eprint("Acceleration was requested, but no supported provider is available; using CPU.")
     else:
-        eprint("CUDA acceleration disabled; using CPUExecutionProvider.")
+        eprint("Hardware acceleration disabled; using CPUExecutionProvider.")

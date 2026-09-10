@@ -1,14 +1,19 @@
 import numpy as np
 from onnxruntime import OrtValue
 
-from homr.onnxruntime_utils import create_inference_session, cuda_provider_options
+from homr.onnxruntime_utils import (
+    create_inference_session,
+    cuda_provider_options,
+    should_accelerate_transformer,
+    uses_fp16_models,
+)
 from homr.transformer.configs import Config
 from homr.type_definitions import NDArray
 
 
 class Encoder:
     def __init__(self, config: Config) -> None:
-        if config.use_gpu_inference:
+        if uses_fp16_models(config.use_gpu_inference):
             self.encoder, self.use_gpu = create_inference_session(
                 config.filepaths.encoder_path_fp16,
                 use_gpu_inference=True,
@@ -20,7 +25,9 @@ class Encoder:
         else:
             self.encoder, self.use_gpu = create_inference_session(
                 config.filepaths.encoder_path,
-                use_gpu_inference=False,
+                use_gpu_inference=should_accelerate_transformer(
+                    config.use_gpu_inference
+                ),
                 component_name="TrOMR encoder",
             )
             self.fp16 = False

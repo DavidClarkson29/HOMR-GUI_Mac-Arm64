@@ -195,7 +195,11 @@ class BarLine(SymbolOnStaff):
         return str(self)
 
     def copy(self) -> "BarLine":
-        return BarLine(self.box)
+        result = BarLine(self.box)
+        # The box remains useful as immutable detection metadata, while ``center``
+        # follows the repeatedly cropped/scaled staff coordinate system.
+        result.center = self.center
+        return result
 
 
 class Clef(SymbolOnStaff):
@@ -301,9 +305,22 @@ class Staff(DebugDrawable):
         grid_b: dict[int, StaffPoint] = {}
         for p in other.grid:
             grid_b[int(round(p.x))] = p
-        x_positions = set(grid_a.keys()).intersection(grid_b.keys())
+        x_positions = set(grid_a.keys()).union(grid_b.keys())
 
-        grid = [grid_a[x].merge(grid_b[x]) for x in sorted(x_positions)]
+        def point_at(points: dict[int, StaffPoint], x: int) -> StaffPoint:
+            if x in points:
+                return points[x]
+            closest_x = min(points, key=lambda value: abs(value - x))
+            closest = points[closest_x]
+            # A locally incomplete staff must not crop the other hand.  Extending
+            # its nearest detected staff-line geometry is safer than discarding
+            # the visible remainder of the complete staff.
+            return StaffPoint(float(x), list(closest.y), closest.angle)
+
+        grid = [
+            point_at(grid_a, x).merge(point_at(grid_b, x))
+            for x in sorted(x_positions)
+        ]
         result = Staff(grid)
         result.symbols.extend(self.symbols)
         result.symbols.extend(other.symbols)

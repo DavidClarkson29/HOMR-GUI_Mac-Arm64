@@ -1,5 +1,5 @@
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -58,7 +58,9 @@ class SymbolChord:
 
     def get_duration(self) -> Fraction:
         notes_rests = [
-            s.get_duration().fraction for s in self.symbols if s.rhythm.startswith(("note", "rest"))
+            _sounding_symbol_duration(s)
+            for s in self.symbols
+            if s.rhythm.startswith(("note", "rest"))
         ]
         if len(notes_rests) == 0:
             return Fraction(0)
@@ -123,9 +125,18 @@ def generate_xml(
     root.add_child(build_identification())
     root.add_child(build_defaults(args))
     has_two_staves_by_part = [_voice_has_two_staves(staff) for staff in staffs]
+    shared_nominator = infer_shared_time_signature_nominator(staffs, has_two_staves_by_part)
     root.add_child(build_part_list(has_two_staves_by_part))
     for index, staff in enumerate(staffs):
-        root.add_child(build_part(args, staff, index, has_two_staves_by_part[index]))
+        root.add_child(
+            build_part(
+                args,
+                staff,
+                index,
+                has_two_staves_by_part[index],
+                shared_nominator,
+            )
+        )
     return root
 
 
@@ -135,11 +146,15 @@ def _voice_has_two_staves(voice: list[EncodedSymbol]) -> bool:
 
 
 def build_part(
-    args: XmlGeneratorArguments, voice: list[EncodedSymbol], index: int, has_two_staves: bool
+    args: XmlGeneratorArguments,
+    voice: list[EncodedSymbol],
+    index: int,
+    has_two_staves: bool,
+    shared_nominator: Fraction | None = None,
 ) -> mxl.XMLPart:
     part = mxl.XMLPart(id=get_part_id(index))
     is_first_part = index == 0
-    measures = build_measures(args, voice, is_first_part, has_two_staves)
+    measures = build_measures(args, voice, is_first_part, has_two_staves, shared_nominator)
     for measure in measures:
         part.add_child(measure)
     return part
@@ -150,19 +165,52 @@ def build_measures(
     voice: list[EncodedSymbol],
     is_first_part: bool,
     has_two_staves: bool = False,
+    shared_nominator: Fraction | None = None,
 ) -> list[mxl.XMLMeasure]:
+    staff_content: dict[int, list[mxl.XMLElement]] = {1: [], 2: []}
+    staff_cursors = {1: 0, 2: 0}
+
+    def flush_staff_content() -> None:
+        """Serialize piano staves as independent MusicXML timelines.
+
+        Transformer chord markers are occasionally missing between vertically aligned
+        notes on a grand staff. Interleaving both staves would then serialize the left
+        hand after the right hand and make the measure (and every following MIDI
+        measure) too long. Each staff therefore owns its cursor; staff 2 is rewound to
+        the measure start with a MusicXML backup.
+        """
+        for child in staff_content[1]:
+            current_measure.add_child(child)
+        if staff_content[2]:
+            if staff_cursors[1] > 0:
+                backup = mxl.XMLBackup()
+                backup.add_child(mxl.XMLDuration(value_=staff_cursors[1]))
+                current_measure.add_child(backup)
+            for child in staff_content[2]:
+                current_measure.add_child(child)
+        staff_content[1].clear()
+        staff_content[2].clear()
+        staff_cursors[1] = 0
+        staff_cursors[2] = 0
+
     def close_current_measure() -> None:
+        flush_staff_content()
         rebalance_measure_voices(current_measure)
         measures.append(current_measure)
 
     measure_number = 1
     groups = add_tuplet_start_stop(group_into_chords(voice))
-    division, nominator = find_division_and_time_signature_nominator(groups)
+    _mark_double_tremolo_pairs(groups, has_two_staves)
+    division, nominator = find_division_and_time_signature_nominator(groups, has_two_staves)
+    if shared_nominator is not None:
+        nominator = shared_nominator
     state = ConversionState(division, nominator)
     measures: list[mxl.XMLMeasure] = []
     current_measure = mxl.XMLMeasure(number=str(measure_number))
     first_attributes = build_or_get_attributes(current_measure, None)
     first_attributes.add_child(build_divisions(division))
+    if not _has_initial_time_signature(voice):
+        build_inferred_time_signature(first_attributes, state)
     if has_two_staves:
         first_attributes.add_child(mxl.XMLStaves(value_=2))
         first_attributes.add_child(mxl.XMLPartSymbol(value_="brace"))
@@ -182,12 +230,12 @@ def build_measures(
                 build_multi_measure_rest(symbol, attributes)
             else:
                 staff_positions = group.into_positions()
-                for pos_no, staff_pos in enumerate(staff_positions):
-                    chord_duration = (
-                        group.get_duration() if pos_no == len(staff_positions) - 1 else Fraction(0)
-                    )
-                    for note_xml in build_note_chord(staff_pos, state, chord_duration):
-                        current_measure.add_child(note_xml)
+                for staff_pos in staff_positions:
+                    staff_num = get_staff(staff_pos.symbols[0])
+                    chord_duration = staff_pos.get_duration()
+                    note_elements = build_note_chord(staff_pos, state, chord_duration)
+                    staff_content[staff_num].extend(note_elements)
+                    staff_cursors[staff_num] += _xml_cursor_delta(note_elements)
             continue
         if rhythm == "newline":
             is_last_measure = group_no == len(groups) - 1
@@ -205,6 +253,7 @@ def build_measures(
             attributes = build_or_get_attributes(current_measure, last_attributes)
             build_time_signature(symbol, attributes, state)
         elif "barline" in rhythm:
+            flush_staff_content()
             if rhythm != "barline":
                 # Standard barlines don't need extra handling
                 barline = build_or_get_barline(current_measure, "right")
@@ -221,6 +270,7 @@ def build_measures(
             barline = build_or_get_barline(current_measure, "right")
             build_repeat(symbol, barline)
         elif rhythm == "repeatEnd":
+            flush_staff_content()
             barline = build_or_get_barline(current_measure, "right")
             build_repeat(symbol, barline)
 
@@ -228,6 +278,7 @@ def build_measures(
             measure_number += 1
             current_measure = mxl.XMLMeasure(number=str(measure_number))
         elif rhythm == "repeatEndStart":
+            flush_staff_content()
             barline = build_or_get_barline(current_measure, "right")
             build_repeat(EncodedSymbol("repeatEnd"), barline)
 
@@ -462,6 +513,42 @@ def build_time_signature(
     state.beats = beats
 
 
+def _has_initial_time_signature(voice: list[EncodedSymbol]) -> bool:
+    """Whether the crop contains a time signature before its first measure content."""
+    for symbol in voice:
+        if symbol.rhythm.startswith("timeSignature"):
+            return True
+        if symbol.rhythm.startswith(("note", "rest")) or "barline" in symbol.rhythm:
+            return False
+    return False
+
+
+def build_inferred_time_signature(attributes: mxl.XMLAttributes, state: ConversionState) -> None:
+    """Write a conservative meter when a screenshot starts in the middle of a score.
+
+    HOMR can infer the typical measure duration even when the printed time
+    signature is outside the crop. Prefer a quarter-note denominator because it is
+    the least surprising DAW interpretation; use eighths only when quarters cannot
+    represent the inferred duration exactly.
+    """
+    measure_duration = Fraction(state.nominator).limit_denominator(32)
+    denominator = 4
+    beats_fraction = measure_duration * denominator
+    if beats_fraction.denominator != 1:
+        denominator = 8
+        beats_fraction = measure_duration * denominator
+    if beats_fraction.denominator != 1:
+        return
+    beats = int(beats_fraction)
+    if beats < 1 or beats > 12:
+        return
+    time = mxl.XMLTime()
+    time.add_child(mxl.XMLBeats(value_=str(beats)))
+    time.add_child(mxl.XMLBeatType(value_=str(denominator)))
+    attributes.add_child(time)
+    state.beats = beats
+
+
 def build_barline_style(barline: EncodedSymbol, xml: mxl.XMLBarline) -> None:
     style_value = "heavy-heavy" if barline.rhythm == "bolddoublebarline" else "light-light"
     style = mxl.XMLBarStyle(value_=style_value)
@@ -513,7 +600,11 @@ DURATION_NAMES = {
 
 
 def build_articulations(
-    note: mxl.XMLNote, articualations: str, tuplet_mark: str, state: ConversionState
+    note: mxl.XMLNote,
+    articualations: str,
+    tuplet_mark: str,
+    state: ConversionState,
+    double_tremolo: bool = False,
 ) -> None:
     notation = mxl.XMLNotations()
     note.add_child(notation)
@@ -543,7 +634,8 @@ def build_articulations(
         elif articulation == "tenuto":
             xml_articulations.append(mxl.XMLTenuto())
         elif articulation == "tremolo":
-            xml_ornaments.append(mxl.XMLTremolo(value_=3, type=state.toggle_tremolo_state()))
+            tremolo_type = state.toggle_tremolo_state() if double_tremolo else "single"
+            xml_ornaments.append(mxl.XMLTremolo(value_=3, type=tremolo_type))
         elif articulation == "trill":
             xml_ornaments.append(mxl.XMLTrillMark())
         elif articulation == "breathMark":
@@ -621,7 +713,9 @@ def build_note_or_rest(
         base_duration = 1 if model_duration.kern == 0 else model_duration.kern
         duration_name = DURATION_NAMES[base_duration]
         note.add_child(mxl.XMLType(value_=duration_name))
-        note.add_child(mxl.XMLDuration(value_=int(model_duration.fraction * state.division)))
+        note.add_child(
+            mxl.XMLDuration(value_=int(_sounding_symbol_duration(model_note) * state.division))
+        )
     else:
         duration_name = DURATION_NAMES[0]
         note.add_child(mxl.XMLType(value_=duration_name))
@@ -632,14 +726,29 @@ def build_note_or_rest(
     note.add_child(mxl.XMLVoice(value_=str(get_xml_voice(staff_num, rhythmic_layer))))
     for _ in range(model_duration.dots):
         note.add_child(mxl.XMLDot())
-    if model_duration.actual_notes != model_duration.normal_notes:
+    if model_duration.actual_notes != model_duration.normal_notes or _has_double_tremolo(
+        model_note
+    ):
         time_modification = mxl.XMLTimeModification()
-        time_modification.add_child(mxl.XMLActualNotes(value_=model_duration.actual_notes))
+        actual_notes = model_duration.actual_notes * (2 if _has_double_tremolo(model_note) else 1)
+        time_modification.add_child(mxl.XMLActualNotes(value_=actual_notes))
         time_modification.add_child(mxl.XMLNormalNotes(value_=model_duration.normal_notes))
         note.add_child(time_modification)
-        build_articulations(note, model_note.articulation, tuplet_mark, state)
+        build_articulations(
+            note,
+            model_note.articulation,
+            tuplet_mark if model_duration.actual_notes != model_duration.normal_notes else "",
+            state,
+            _has_double_tremolo(model_note),
+        )
     else:
-        build_articulations(note, model_note.articulation, "", state)
+        build_articulations(
+            note,
+            model_note.articulation,
+            "",
+            state,
+            _has_double_tremolo(model_note),
+        )
 
     return note
 
@@ -689,9 +798,26 @@ def build_note_chord(
     return result
 
 
+def _xml_cursor_delta(elements: list[mxl.XMLElement]) -> int:
+    """Return the net MusicXML cursor movement of a generated note group."""
+    cursor = 0
+    for element in elements:
+        durations = element.get_children_of_type(mxl.XMLDuration)
+        duration = int(durations[0].value_) if durations else 0
+        if isinstance(element, mxl.XMLBackup):
+            cursor -= duration
+        elif element.__class__.__name__ == "XMLForward":
+            cursor += duration
+        elif isinstance(element, mxl.XMLNote):
+            is_chord_tone = len(element.get_children_of_type(mxl.XMLChord)) > 0
+            if not is_chord_tone:
+                cursor += duration
+    return max(cursor, 0)
+
+
 def _group_notes(notes: list[EncodedSymbol]) -> dict[Fraction, list[EncodedSymbol]]:
     groups_by_duration = defaultdict(list)
-    max_duration = max([n.get_duration().fraction for n in notes])
+    max_duration = max([_sounding_symbol_duration(n) for n in notes])
     for note in notes:
         duration = note.get_duration()
         is_grace = "G" in note.rhythm
@@ -701,9 +827,88 @@ def _group_notes(notes: list[EncodedSymbol]) -> dict[Fraction, list[EncodedSymbo
             # Whole measure rest
             fraction = max_duration
         else:
-            fraction = duration.fraction
+            fraction = _sounding_symbol_duration(note)
         groups_by_duration[fraction].append(note)
     return groups_by_duration
+
+
+def _has_tremolo_mark(symbol: EncodedSymbol) -> bool:
+    return "tremolo" in symbol.articulation.split("_")
+
+
+def _has_double_tremolo(symbol: EncodedSymbol) -> bool:
+    return bool(getattr(symbol, "_homr_double_tremolo", False))
+
+
+def _sounding_symbol_duration(symbol: EncodedSymbol) -> Fraction:
+    duration = symbol.get_duration().fraction
+    if _has_double_tremolo(symbol) and duration > 0:
+        return duration / 2
+    return duration
+
+
+def _mark_double_tremolo_pairs(groups: list[SymbolChord], independent_staves: bool) -> None:
+    """Pair double-note tremolos within one printed staff and measure.
+
+    Isolated tremolo marks remain single-note tremolos and keep their full duration.
+    A missing stop mark is recovered only when the staff contains exactly two equal
+    rhythmic events in that measure, which covers a common OMR omission without
+    pairing an arbitrary following note.
+    """
+    measure_groups: list[SymbolChord] = []
+
+    def mark_measure() -> None:
+        by_staff: dict[int, list[list[EncodedSymbol]]] = {1: [], 2: []}
+        for group in measure_groups:
+            positions = group.into_positions() if independent_staves else [group]
+            for position in positions:
+                symbols = [
+                    symbol
+                    for symbol in position.symbols
+                    if symbol.rhythm.startswith(("note_", "rest_"))
+                ]
+                if symbols:
+                    staff = get_staff(symbols[0]) if independent_staves else 1
+                    by_staff[staff].append(symbols)
+
+        for events in by_staff.values():
+            paired: set[int] = set()
+            for index in range(len(events) - 1):
+                if index in paired or index + 1 in paired:
+                    continue
+                if any(_has_tremolo_mark(symbol) for symbol in events[index]) and any(
+                    _has_tremolo_mark(symbol) for symbol in events[index + 1]
+                ):
+                    paired.update((index, index + 1))
+            if len(events) == 2 and not paired:
+                marks = [any(_has_tremolo_mark(symbol) for symbol in event) for event in events]
+                left_duration = min(
+                    (symbol.get_duration().fraction for symbol in events[0]),
+                    default=Fraction(0),
+                )
+                right_duration = min(
+                    (symbol.get_duration().fraction for symbol in events[1]),
+                    default=Fraction(0),
+                )
+                if sum(marks) == 1 and left_duration == right_duration > 0:
+                    paired.update((0, 1))
+                    marked_index = marks.index(True)
+                    missing_index = 1 - marked_index
+                    for symbol in events[missing_index]:
+                        suffix = "" if symbol.articulation in ("", nonote) else "_"
+                        symbol.articulation += suffix + "tremolo"
+            for index in paired:
+                for symbol in events[index]:
+                    symbol._homr_double_tremolo = True  # type: ignore[attr-defined]
+
+    for group in groups:
+        if group.is_barline():
+            mark_measure()
+            measure_groups.clear()
+        else:
+            measure_groups.append(group)
+    if measure_groups:
+        mark_measure()
 
 
 def build_add_time_direction(args: XmlGeneratorArguments) -> mxl.XMLDirection | None:
@@ -743,25 +948,169 @@ def find_common_division(durations: list[Fraction]) -> int:
     return common
 
 
-def find_division_and_time_signature_nominator(voice: list[SymbolChord]) -> tuple[int, Fraction]:
-    durations = [Fraction(1, 4)]
-    duration_in_measure = Fraction(0)
-    measure_duration = []
-    for chord in voice:
-        if chord.is_barline() and duration_in_measure > Fraction(0):
-            measure_duration.append(duration_in_measure)
-            duration_in_measure = Fraction(0)
-        else:
-            duration = chord.get_duration()
-            if duration > Fraction(0):
-                durations.append(duration)
-                duration_in_measure += duration
+def _is_uninformative_whole_rest(chord: SymbolChord) -> bool:
+    """Whole rests adapt to the bar and must not vote for a 4/4 meter."""
+    return len(chord.symbols) == 1 and chord.symbols[0].rhythm == "rest_1"
 
-    if duration_in_measure > Fraction(0):
-        measure_duration.append(duration_in_measure)
-        duration_in_measure = Fraction(0)
+
+def _measure_staff_groups(
+    voice: list[SymbolChord], independent_staves: bool
+) -> list[dict[int, list[SymbolChord]]]:
+    measures: list[dict[int, list[SymbolChord]]] = []
+    current: dict[int, list[SymbolChord]] = {1: [], 2: []}
+
+    def close_measure() -> None:
+        if any(current.values()):
+            measures.append({staff: list(groups) for staff, groups in current.items()})
+        current[1].clear()
+        current[2].clear()
+
+    for chord_group in voice:
+        if chord_group.is_barline():
+            close_measure()
+            continue
+        positions = chord_group.into_positions() if independent_staves else [chord_group]
+        for position in positions:
+            if _is_uninformative_whole_rest(position):
+                continue
+            duration = position.get_duration()
+            if duration <= 0:
+                continue
+            staff_num = get_staff(position.symbols[0]) if independent_staves else 1
+            current[staff_num].append(position)
+    close_measure()
+    return measures
+
+
+def _groups_duration(groups: list[SymbolChord]) -> Fraction:
+    return sum((group.get_duration() for group in groups), Fraction(0))
+
+
+def _looks_like_unmarked_triplet_bar(
+    groups: list[SymbolChord], long_duration: Fraction, short_duration: Fraction
+) -> bool:
+    """Recognize a complete equal-note run decoded 3:2 too long.
+
+    This is deliberately stricter than merely preferring the shorter piano staff:
+    the long staff must consist of at least two complete groups of three equal,
+    ordinary (non-tuplet) notes and must be exactly 3/2 of the other staff. That
+    distinguishes a missed triplet ratio from a genuinely sparse 6/4 staff.
+    """
+    if len(groups) < 6 or len(groups) % 3 != 0 or long_duration != short_duration * Fraction(3, 2):
+        return False
+    durations = {group.get_duration() for group in groups}
+    if len(durations) != 1:
+        return False
+    rhythmic_symbols = [
+        symbol
+        for group in groups
+        for symbol in group.symbols
+        if symbol.rhythm.startswith(("note_", "rest_"))
+    ]
+    return bool(rhythmic_symbols) and all(
+        symbol.get_duration().actual_notes == symbol.get_duration().normal_notes
+        and not symbol.rhythm.endswith("m")
+        and "G" not in symbol.rhythm
+        for symbol in rhythmic_symbols
+    )
+
+
+def _resolved_measure_duration(groups_by_staff: dict[int, list[SymbolChord]]) -> Fraction | None:
+    populated = {
+        staff: _groups_duration(groups)
+        for staff, groups in groups_by_staff.items()
+        if groups and _groups_duration(groups) > 0
+    }
+    if not populated:
+        return None
+    if len(populated) == 1:
+        return next(iter(populated.values()))
+    upper = populated.get(1, Fraction(0))
+    lower = populated.get(2, Fraction(0))
+    if upper == lower:
+        return upper
+    long_staff = 1 if upper > lower else 2
+    long_duration = max(upper, lower)
+    short_duration = min(upper, lower)
+    if _looks_like_unmarked_triplet_bar(groups_by_staff[long_staff], long_duration, short_duration):
+        return short_duration
+    return None
+
+
+def _measure_duration_votes(voice: list[SymbolChord], independent_staves: bool) -> list[Fraction]:
+    return [
+        duration
+        for measure in _measure_staff_groups(voice, independent_staves)
+        if (duration := _resolved_measure_duration(measure)) is not None
+    ]
+
+
+def infer_shared_time_signature_nominator(
+    voices: list[list[EncodedSymbol]], has_two_staves_by_part: list[bool]
+) -> Fraction | None:
+    """Infer one page-wide meter without merging instruments or staves.
+
+    Every informative measure on every piano votes for its nearest conventional bar
+    duration. Whole-measure rests are excluded because ``rest_1`` adapts to the
+    surrounding meter. A winner needs repeated evidence and an absolute majority;
+    ambiguous pages fall back to the established per-part inference path.
+
+    The result is a duration, not a forced denominator. An explicit ``/8`` token can
+    therefore still distinguish 6/8 from 3/4 when the printed signature is visible.
+    """
+    if not voices:
+        return None
+    votes: Counter[Fraction] = Counter()
+    conventional = (
+        Fraction(3, 8),
+        Fraction(1, 2),
+        Fraction(3, 4),
+        Fraction(1),
+        Fraction(5, 4),
+        Fraction(3, 2),
+        Fraction(7, 4),
+        Fraction(2),
+    )
+    informative_measure_count = 0
+    for voice, independent_staves in zip(voices, has_two_staves_by_part, strict=True):
+        groups = group_into_chords(voice)
+        for duration in _measure_duration_votes(groups, independent_staves):
+            nearest = min(conventional, key=lambda candidate: abs(candidate - duration))
+            if abs(nearest - duration) <= Fraction(1, 8):
+                votes[nearest] += 1
+                informative_measure_count += 1
+    if not votes:
+        return None
+    winner, count = votes.most_common(1)[0]
+    tied = [duration for duration, votes_count in votes.items() if votes_count == count]
+    if len(tied) > 1 or count < 2 or count * 2 <= informative_measure_count:
+        return None
+    eprint(
+        "Global meter consensus across",
+        len(voices),
+        "piano instruments using measure duration",
+        winner,
+    )
+    return winner
+
+
+def find_division_and_time_signature_nominator(
+    voice: list[SymbolChord], independent_staves: bool = False
+) -> tuple[int, Fraction]:
+    durations = [Fraction(1, 4)]
+    for chord in voice:
+        positions = chord.into_positions() if independent_staves else [chord]
+        durations.extend(
+            position.get_duration()
+            for position in positions
+            if position.get_duration() > Fraction(0)
+        )
+
+    measure_duration = _measure_duration_votes(voice, independent_staves)
 
     if len(measure_duration) == 0:
+        # Conflicting piano staves without a visible signature are safer in the
+        # conventional 4/4 fallback than in the old longest-staff inference.
         return find_common_division(durations), Fraction(1)
 
     nominator: Fraction = np.median(measure_duration)  # type: ignore

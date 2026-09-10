@@ -11,7 +11,7 @@ from homr.bounding_boxes import (
     create_rotated_bounding_box,
 )
 from homr.debug import Debug
-from homr.model import Staff, StaffPoint
+from homr.model import BarLine, Staff, StaffPoint
 from homr.simple_logging import eprint
 from homr.type_definitions import NDArray
 
@@ -708,9 +708,10 @@ def detect_staff(
     eprint("Found " + str(len(possible_other_clefs)) + " possible other clefs")
     staff_anchors.extend(find_staff_anchors(staff_fragments, possible_other_clefs, are_clefs=True))
 
-    staff_anchors.extend(
-        find_staff_anchors(staff_fragments, likely_bar_or_rests_lines, are_clefs=False)
+    barline_anchors = find_staff_anchors(
+        staff_fragments, likely_bar_or_rests_lines, are_clefs=False
     )
+    staff_anchors.extend(barline_anchors)
 
     staff_anchors = filter_unusual_anchors(staff_anchors)
     eprint("Found " + str(len(staff_anchors)) + " staff anchors")
@@ -732,6 +733,18 @@ def detect_staff(
     )
 
     staffs = resample_staffs(raw_staffs)
+
+    # Retain only vertical candidates that independently passed the staff-anchor
+    # geometry checks.  The transformer can then use these as corroborating
+    # evidence when it misses an otherwise visible internal barline.
+    barline_symbols = {id(anchor.symbol) for anchor in barline_anchors}
+    for raw_staff, staff in zip(raw_staffs, staffs, strict=True):
+        seen: set[int] = set()
+        for anchor in raw_staff.anchors:
+            symbol_id = id(anchor.symbol)
+            if symbol_id in barline_symbols and symbol_id not in seen:
+                staff.add_symbol(BarLine(anchor.symbol))
+                seen.add(symbol_id)
 
     staffs = filter_edge_of_vision(staffs, image.shape)
 

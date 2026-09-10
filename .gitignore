@@ -24,6 +24,17 @@ _debug/
 History/
 res/   # 如果 res 文件夹里只有你截图里的那些 UI 图片则保留，如果有大文件就排除
 
+# Local Codex/build artifacts
+/.venv/
+/work/
+/outputs/
+/build/
+/dist/
+.DS_Store
+.codex/
+rollback/
+.pytest_cache/
+
 # 排除运行产生的临时文件
 *.png
 *.musicxml

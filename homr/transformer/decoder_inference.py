@@ -3,7 +3,12 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 
-from homr.onnxruntime_utils import CUDA_EP, create_inference_session
+from homr.onnxruntime_utils import (
+    CUDA_EP,
+    create_inference_session,
+    should_accelerate_transformer,
+    uses_fp16_models,
+)
 from homr.simple_logging import eprint
 from homr.transformer.configs import Config
 from homr.transformer.vocabulary import EncodedSymbol
@@ -131,6 +136,9 @@ class ScoreDecoder:
                 articulation=articulation_token[0],
                 position=position_token[0],
                 coordinates=attention,
+                rhythm_candidates=_duration_candidates(
+                    rhythmsp[0, -1, :], rhythm_token[0], self.inv_rhythm_vocab
+                ),
             )
             symbols.append(symbol)
 
@@ -169,6 +177,38 @@ class ScoreDecoder:
         return cache, input_names, output_names
 
 
+def _duration_candidates(
+    logits: NDArray,
+    selected_token: str,
+    vocabulary: dict[int, str],
+    limit: int = 5,
+) -> tuple[tuple[str, float], ...]:
+    """Keep plausible same-kind rhythm alternatives for measure-level correction."""
+    if not selected_token.startswith(("note_", "rest_")):
+        return ()
+
+    family = selected_token.split("_", 1)[0]
+    selected_is_grace = "G" in selected_token.split("_", 1)[1]
+    selected_index = next(
+        (index for index, token in vocabulary.items() if token == selected_token), None
+    )
+    if selected_index is None:
+        return ()
+
+    selected_logit = float(logits[selected_index])
+    alternatives: list[tuple[str, float]] = []
+    for index, token in vocabulary.items():
+        if not token.startswith(family + "_"):
+            continue
+        if ("G" in token.split("_", 1)[1]) != selected_is_grace:
+            continue
+        penalty = max(0.0, selected_logit - float(logits[index]))
+        alternatives.append((token, penalty))
+
+    alternatives.sort(key=lambda item: (item[1], item[0] != selected_token))
+    return tuple(alternatives[:limit])
+
+
 def detokenize(tokens: NDArray, vocab: dict[int, str]) -> list[str]:
     toks = [vocab[tok.item()] for tok in tokens]
     toks = [t for t in toks if t not in ("[BOS]", "[EOS]", "[PAD]")]
@@ -179,7 +219,7 @@ def get_decoder(config: Config) -> ScoreDecoder:
     """
     Returns Tromr's Decoder
     """
-    if config.use_gpu_inference:
+    if uses_fp16_models(config.use_gpu_inference):
         onnx_transformer, use_gpu = create_inference_session(
             config.filepaths.decoder_path_fp16,
             use_gpu_inference=True,
@@ -192,7 +232,9 @@ def get_decoder(config: Config) -> ScoreDecoder:
     else:
         onnx_transformer, use_gpu = create_inference_session(
             config.filepaths.decoder_path,
-            use_gpu_inference=False,
+            use_gpu_inference=should_accelerate_transformer(
+                config.use_gpu_inference
+            ),
             component_name="TrOMR decoder",
         )
         fp16 = False
