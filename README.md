@@ -1,5 +1,3 @@
-<img width="172" height="203" alt="Snipaste_2026-05-12_20-01-11" src="https://github.com/user-attachments/assets/cc08dc83-b856-46c4-8b37-aabc2e652519" />
-
 # HOMR GUI (Music Score to MIDI)
 
 本项目是基于 [liebharc/homr](https://github.com/liebharc/homr) 的 GUI 封装与增强版本。
